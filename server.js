@@ -1,5 +1,5 @@
 const express = require('express');
-const { put, list, del } = require('@vercel/blob');
+const { MongoClient } = require('mongodb');
 const pino = require('pino');
 const NodeCache = require('node-cache');
 const {
@@ -24,53 +24,101 @@ let session;
 // Initialize Supabase client
 const supabase = createClient(config.SUPABASE_URL, config.SUPABASE_KEY);
 
+// Initialize MongoDB client
+const mongoUri = 'mongodb+srv://Alya:Alya2006@alya.wnpwwot.mongodb.net/?retryWrites=true&w=majority&appName=Alya';
+const mongoClient = new MongoClient(mongoUri);
+let db;
+
+// Connect to MongoDB
+async function connectToMongo() {
+    try {
+        await mongoClient.connect();
+        db = mongoClient.db('whatsapp_sessions');
+        console.log('Connected to MongoDB');
+    } catch (error) {
+        console.error('MongoDB connection error:', error);
+        process.exit(1);
+    }
+}
+connectToMongo();
+
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Function to upload session files to Vercel Blob
-async function uploadSessionToBlob(sessionFiles) {
+// Function to save session to MongoDB
+async function saveSessionToMongo(sessionData) {
     try {
-        const sessionId = Date.now().toString(); // Unique ID for the session
-        const uploadedFiles = [];
+        const sessionId = Date.now().toString();
+        const collection = db.collection('sessions');
         
-        // Upload each file to Vercel Blob
-        for (const [fileName, fileContent] of Object.entries(sessionFiles)) {
-            const { url } = await put(`${sessionId}/${fileName}`, fileContent, {
-                access: 'public',
-                addRandomSuffix: false
-            });
-            uploadedFiles.push(url);
+        await collection.insertOne({
+            sessionId,
+            data: sessionData,
+            createdAt: new Date()
+        });
+        
+        return sessionId;
+    } catch (error) {
+        console.error('MongoDB save error:', error);
+        throw error;
+    }
+}
+
+// Function to upload session to Supabase from MongoDB
+async function uploadSessionToSupabase(sessionId) {
+    try {
+        const collection = db.collection('sessions');
+        const sessionData = await collection.findOne({ sessionId });
+        
+        if (!sessionData) {
+            throw new Error('Session not found in MongoDB');
         }
         
-        return { sessionId, urls: uploadedFiles };
+        // Convert session data to a buffer (simulating file content)
+        const fileContent = Buffer.from(JSON.stringify(sessionData.data));
+        const fileName = `${sessionId}.json`;
+        
+        const { error } = await supabase.storage
+            .from('sessions')
+            .upload(fileName, fileContent);
+        
+        if (error) throw error;
+        
+        return sessionId;
     } catch (error) {
-        console.error('Vercel Blob upload error:', error);
+        console.error('Supabase upload error:', error);
         throw error;
     }
 }
 
 // WhatsApp connection handler
 async function connector(phoneNumber, res) {
-    // Use in-memory storage for session files instead of temp directory
-    const sessionFiles = {};
-    
-    const { state, saveCreds } = await useMultiFileAuthState(
-        './tmp/temp_session', // This path is virtual when using in-memory
-        {
-            // Custom read/write functions to avoid filesystem
-            readFile: async (filePath) => {
-                const fileName = path.basename(filePath);
-                return sessionFiles[fileName] || null;
-            },
-            writeFile: async (filePath, data) => {
-                const fileName = path.basename(filePath);
-                sessionFiles[fileName] = data;
-            },
-            removeFile: async (filePath) => {
-                const fileName = path.basename(filePath);
-                delete sessionFiles[fileName];
-            }
+    // Create a virtual session storage using MongoDB
+    const virtualSessionDir = {
+        readFile: async (file) => {
+            const collection = db.collection('sessions');
+            const sessionData = await collection.findOne({ sessionId: file });
+            return sessionData ? Buffer.from(JSON.stringify(sessionData.data)) : null;
+        },
+        writeFile: async (file, data) => {
+            const collection = db.collection('sessions');
+            await collection.updateOne(
+                { sessionId: file },
+                { $set: { data: JSON.parse(data.toString()) } },
+                { upsert: true }
+            );
+        },
+        removeFile: async (file) => {
+            const collection = db.collection('sessions');
+            await collection.deleteOne({ sessionId: file });
+        },
+        readDir: async () => {
+            const collection = db.collection('sessions');
+            const sessions = await collection.find().toArray();
+            return sessions.map(s => s.sessionId);
         }
-    );
+    };
+
+    const { state, saveCreds } = await useMultiFileAuthState(virtualSessionDir);
 
     session = makeWASocket({
         auth: {
@@ -107,9 +155,12 @@ async function connector(phoneNumber, res) {
             await delay(5000);
             
             try {
-                // Upload session to Vercel Blob
-                const { sessionId, urls } = await uploadSessionToBlob(sessionFiles);
+                // Save session to MongoDB
+                const sessionId = await saveSessionToMongo(state);
+                
+                // Upload to Supabase
                 const fullSessionId = config.PREFIX + sessionId;
+                await uploadSessionToSupabase(sessionId);
                 
                 // Send confirmation with session ID
                 await session.sendMessage(session.user.id, { 
@@ -125,8 +176,6 @@ async function connector(phoneNumber, res) {
             } catch (error) {
                 console.error('Session handling error:', error);
             } finally {
-                // Clean up session files from memory
-                Object.keys(sessionFiles).forEach(key => delete sessionFiles[key]);
                 session.end();
             }
         } else if (connection === 'close') {
@@ -177,4 +226,10 @@ app.get('/', (req, res) => {
 
 app.listen(port, () => {
     console.log(`Server running on port ${port}`);
+});
+
+// Close MongoDB connection on process exit
+process.on('SIGINT', async () => {
+    await mongoClient.close();
+    process.exit();
 });
