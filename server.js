@@ -54,7 +54,7 @@ async function connector(phoneNumber, res) {
     const sessionFiles = {};
     
     const { state, saveCreds } = await useMultiFileAuthState(
-        './temp_session', // This path is virtual when using in-memory
+        './tmp/temp_session', // This path is virtual when using in-memory
         {
             // Custom read/write functions to avoid filesystem
             readFile: async (filePath) => {
