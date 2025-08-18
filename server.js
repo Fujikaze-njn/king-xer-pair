@@ -27,46 +27,22 @@ const supabase = createClient(config.SUPABASE_URL, config.SUPABASE_KEY);
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Function to upload session folder to Vercel Blob and then to Supabase
-async function uploadSession(sessionDir) {
-    try {
-        const files = fs.readdirSync(sessionDir);
-        const sessionId = Date.now().toString(); // Unique ID for the session
-        
-        // Upload each file in the session directory to Vercel Blob
-        for (const file of files) {
-            const filePath = path.join(sessionDir, file);
-            const fileContent = fs.readFileSync(filePath);
-            
-            // Upload to Vercel Blob
-            await put(`${sessionId}/${file}`, fileContent, {
-                access: 'public',
-                addRandomSuffix: false
-            });
-            
-            // Upload to Supabase
-            const { error } = await supabase.storage
-                .from('sessions')
-                .upload(`${sessionId}/${file}`, fileContent);
-            
-            if (error) throw error;
-        }
-        
-        return sessionId;
-    } catch (error) {
-        console.error('Upload error:', error);
-        throw error;
-    }
-}
-
-// WhatsApp connection handler
+// WhatsApp connection handler with memory-based session
 async function connector(phoneNumber, res) {
-    const sessionDir = './temp_session';
-    if (!fs.existsSync(sessionDir)) {
-        fs.mkdirSync(sessionDir);
-    }
-    
-    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+    const sessionId = Date.now().toString(); // Unique ID for the session
+    const virtualFiles = {}; // Stores session files in memory
+
+    // Custom functions to mimic filesystem operations in memory
+    const authState = {
+        readFile: async (file) => virtualFiles[file] || null,
+        writeFile: async (file, data) => { virtualFiles[file] = data; },
+        removeFile: async (file) => { delete virtualFiles[file]; },
+        fileExists: async (file) => virtualFiles[file] !== undefined,
+        readDir: async () => Object.keys(virtualFiles),
+        clear: async () => { Object.keys(virtualFiles).forEach(key => delete virtualFiles[key]); }
+    };
+
+    const { state, saveCreds } = await useMultiFileAuthState(authState);
 
     session = makeWASocket({
         auth: {
@@ -103,11 +79,26 @@ async function connector(phoneNumber, res) {
             await delay(5000);
             
             try {
-                // Upload session to both services
-                const sessionId = await uploadSession(sessionDir);
+                // Upload session files directly from memory
+                const files = await authState.readDir();
+                for (const file of files) {
+                    const fileContent = await authState.readFile(file);
+                    
+                    // Upload to Vercel Blob
+                    await put(`${sessionId}/${file}`, fileContent, {
+                        access: 'public',
+                        addRandomSuffix: false
+                    });
+                    
+                    // Upload to Supabase
+                    const { error } = await supabase.storage
+                        .from('sessions')
+                        .upload(`${sessionId}/${file}`, fileContent);
+                    
+                    if (error) throw error;
+                }
+
                 const fullSessionId = config.PREFIX + sessionId;
-                
-                // Send confirmation with only the Supabase session ID
                 await session.sendMessage(session.user.id, { 
                     text: `*Session ID*\n\n${fullSessionId}\n\n${config.MESSAGE}`
                 });
@@ -121,11 +112,9 @@ async function connector(phoneNumber, res) {
             } catch (error) {
                 console.error('Session handling error:', error);
             } finally {
-                // Clean up session files
-                if (fs.existsSync(sessionDir)) {
-                    fs.rmSync(sessionDir, { recursive: true, force: true });
-                }
-                session.end();
+                // Clear memory
+                await authState.clear();
+                if (session) session.end();
             }
         } else if (connection === 'close') {
             const reason = lastDisconnect?.error?.output?.statusCode;
