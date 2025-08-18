@@ -1,5 +1,5 @@
 const express = require('express');
-const { MongoClient } = require('mongodb');
+const mongoose = require('mongoose');
 const pino = require('pino');
 const NodeCache = require('node-cache');
 const {
@@ -24,17 +24,24 @@ let session;
 // Initialize Supabase client
 const supabase = createClient(config.SUPABASE_URL, config.SUPABASE_KEY);
 
-// Initialize MongoDB client
-const mongoUri = 'mongodb+srv://Alya:Alya2006@alya.wnpwwot.mongodb.net/?retryWrites=true&w=majority&appName=Alya';
-const mongoClient = new MongoClient(mongoUri);
-let db;
+// Define Mongoose Session Schema
+const sessionSchema = new mongoose.Schema({
+    sessionId: { type: String, required: true, unique: true },
+    data: { type: Object, required: true },
+    createdAt: { type: Date, default: Date.now }
+});
 
-// Connect to MongoDB
+// Create Session model
+const Session = mongoose.model('Session', sessionSchema);
+
+// Connect to MongoDB with Mongoose
 async function connectToMongo() {
     try {
-        await mongoClient.connect();
-        db = mongoClient.db('whatsapp_sessions');
-        console.log('Connected to MongoDB');
+        const mongoUri = 'mongodb+srv://Alya:Alya2006@alya.wnpwwot.mongodb.net/whatsapp_sessions?retryWrites=true&w=majority&appName=Alya';
+        
+        await mongoose.connect(mongoUri);
+        
+        console.log('Connected to MongoDB with Mongoose');
     } catch (error) {
         console.error('MongoDB connection error:', error);
         process.exit(1);
@@ -48,14 +55,12 @@ app.use(express.static(path.join(__dirname, 'public')));
 async function saveSessionToMongo(sessionData) {
     try {
         const sessionId = Date.now().toString();
-        const collection = db.collection('sessions');
-        
-        await collection.insertOne({
+        const newSession = new Session({
             sessionId,
-            data: sessionData,
-            createdAt: new Date()
+            data: sessionData
         });
         
+        await newSession.save();
         return sessionId;
     } catch (error) {
         console.error('MongoDB save error:', error);
@@ -66,8 +71,7 @@ async function saveSessionToMongo(sessionData) {
 // Function to upload session to Supabase from MongoDB
 async function uploadSessionToSupabase(sessionId) {
     try {
-        const collection = db.collection('sessions');
-        const sessionData = await collection.findOne({ sessionId });
+        const sessionData = await Session.findOne({ sessionId });
         
         if (!sessionData) {
             throw new Error('Session not found in MongoDB');
@@ -95,25 +99,21 @@ async function connector(phoneNumber, res) {
     // Create a virtual session storage using MongoDB
     const virtualSessionDir = {
         readFile: async (file) => {
-            const collection = db.collection('sessions');
-            const sessionData = await collection.findOne({ sessionId: file });
+            const sessionData = await Session.findOne({ sessionId: file });
             return sessionData ? Buffer.from(JSON.stringify(sessionData.data)) : null;
         },
         writeFile: async (file, data) => {
-            const collection = db.collection('sessions');
-            await collection.updateOne(
+            await Session.findOneAndUpdate(
                 { sessionId: file },
-                { $set: { data: JSON.parse(data.toString()) } },
-                { upsert: true }
+                { data: JSON.parse(data.toString()) },
+                { upsert: true, new: true }
             );
         },
         removeFile: async (file) => {
-            const collection = db.collection('sessions');
-            await collection.deleteOne({ sessionId: file });
+            await Session.deleteOne({ sessionId: file });
         },
         readDir: async () => {
-            const collection = db.collection('sessions');
-            const sessions = await collection.find().toArray();
+            const sessions = await Session.find({}, 'sessionId');
             return sessions.map(s => s.sessionId);
         }
     };
@@ -228,8 +228,8 @@ app.listen(port, () => {
     console.log(`Server running on port ${port}`);
 });
 
-// Close MongoDB connection on process exit
+// Close Mongoose connection on process exit
 process.on('SIGINT', async () => {
-    await mongoClient.close();
+    await mongoose.connection.close();
     process.exit();
 });
