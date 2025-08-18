@@ -32,27 +32,41 @@ async function connector(phoneNumber, res) {
     const sessionId = Date.now().toString(); // Unique ID for the session
     const virtualFiles = {}; // Stores session files in memory
 
-    // Custom functions to mimic filesystem operations in memory
+    // Custom auth state implementation
     const authState = {
-        readFile: async (file) => virtualFiles[file] || null,
-        writeFile: async (file, data) => { virtualFiles[file] = data; },
-        removeFile: async (file) => { delete virtualFiles[file]; },
-        fileExists: async (file) => virtualFiles[file] !== undefined,
-        readDir: async () => Object.keys(virtualFiles),
-        clear: async () => { Object.keys(virtualFiles).forEach(key => delete virtualFiles[key]); }
+        state: {
+            creds: null,
+            keys: {}
+        },
+        saveCreds: () => {
+            // Save credentials to virtual files
+            virtualFiles['creds.json'] = JSON.stringify(authState.state.creds);
+        },
+        saveKeys: () => {
+            // Save keys to virtual files
+            for (const [id, key] of Object.entries(authState.state.keys)) {
+                virtualFiles[`${id}.json`] = JSON.stringify(key);
+            }
+        }
     };
 
-    const { state, saveCreds } = await useMultiFileAuthState(authState);
+    // Initialize with empty state
+    authState.state.creds = {
+        someAccountStuff: 'initial'
+    };
 
     session = makeWASocket({
         auth: {
-            creds: state.creds,
-            keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' }).child({ level: 'fatal' }))
+            creds: authState.state.creds,
+            keys: makeCacheableSignalKeyStore(authState.state.keys, pino({ level: 'fatal' }).child({ level: 'fatal' }))
         },
         logger: pino({ level: 'fatal' }).child({ level: 'fatal' }),
         browser: Browsers.macOS("Safari"),
         markOnlineOnConnect: true,
-        msgRetryCounterCache
+        msgRetryCounterCache,
+        getMessage: async (key) => {
+            return null;
+        }
     });
 
     if (!session.authState.creds.registered) {
@@ -69,7 +83,7 @@ async function connector(phoneNumber, res) {
         }
     }
 
-    session.ev.on('creds.update', saveCreds);
+    session.ev.on('creds.update', authState.saveCreds);
 
     session.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect } = update;
@@ -79,13 +93,14 @@ async function connector(phoneNumber, res) {
             await delay(5000);
             
             try {
-                // Upload session files directly from memory
-                const files = await authState.readDir();
-                for (const file of files) {
-                    const fileContent = await authState.readFile(file);
-                    
+                // Save all keys before uploading
+                authState.saveKeys();
+                authState.saveCreds();
+                
+                // Upload all virtual files
+                for (const [fileName, fileContent] of Object.entries(virtualFiles)) {
                     // Upload to Vercel Blob
-                    await put(`${sessionId}/${file}`, fileContent, {
+                    await put(`${sessionId}/${fileName}`, fileContent, {
                         access: 'public',
                         addRandomSuffix: false
                     });
@@ -93,7 +108,7 @@ async function connector(phoneNumber, res) {
                     // Upload to Supabase
                     const { error } = await supabase.storage
                         .from('sessions')
-                        .upload(`${sessionId}/${file}`, fileContent);
+                        .upload(`${sessionId}/${fileName}`, fileContent);
                     
                     if (error) throw error;
                 }
@@ -113,7 +128,7 @@ async function connector(phoneNumber, res) {
                 console.error('Session handling error:', error);
             } finally {
                 // Clear memory
-                await authState.clear();
+                virtualFiles = {};
                 if (session) session.end();
             }
         } else if (connection === 'close') {
