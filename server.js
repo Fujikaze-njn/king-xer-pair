@@ -4,7 +4,7 @@ const pino = require('pino');
 const NodeCache = require('node-cache');
 const {
     default: makeWASocket,
-    useMultiFileAuthState,
+    useSingleFileAuthState,
     delay,
     Browsers,
     makeCacheableSignalKeyStore,
@@ -26,39 +26,22 @@ const supabase = createClient(config.SUPABASE_URL, config.SUPABASE_KEY);
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Function to upload session folder to Supabase
-async function uploadSession(sessionDir) {
-    try {
-        const files = fs.readdirSync(sessionDir);
-        const sessionId = Date.now().toString(); // Unique ID for the session
-        
-        // Upload each file in the session directory
-        for (const file of files) {
-            const filePath = path.join(sessionDir, file);
-            const fileContent = fs.readFileSync(filePath);
+// WhatsApp connection handler
+async function connector(phoneNumber, res) {
+    const { state, saveCreds } = await useSingleFileAuthState({
+        save: async (data) => {
+            const sessionData = Buffer.from(JSON.stringify(data));
+            const sessionId = Date.now().toString();
+            const fileName = `${sessionId}/creds.json`;
             
             const { error } = await supabase.storage
                 .from('sessions')
-                .upload(`${sessionId}/${file}`, fileContent);
-            
+                .upload(fileName, sessionData);
+                
             if (error) throw error;
-        }
-        
-        return sessionId;
-    } catch (error) {
-        console.error('Supabase upload error:', error);
-        throw error;
-    }
-}
-
-// WhatsApp connection handler
-async function connector(phoneNumber, res) {
-    const sessionDir = './temp_session';
-    if (!fs.existsSync(sessionDir)) {
-        fs.mkdirSync(sessionDir);
-    }
-    
-    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+        },
+        load: async () => ({}),
+    });
 
     session = makeWASocket({
         auth: {
@@ -95,8 +78,8 @@ async function connector(phoneNumber, res) {
             await delay(5000);
             
             try {
-                // Upload session to Supabase
-                const sessionId = await uploadSession(sessionDir);
+                // Get the session ID from the latest creds
+                const sessionId = Object.keys(state.creds)[0] || Date.now().toString();
                 const fullSessionId = config.PREFIX + sessionId;
                 
                 // Send confirmation with session ID
@@ -113,10 +96,6 @@ async function connector(phoneNumber, res) {
             } catch (error) {
                 console.error('Session handling error:', error);
             } finally {
-                // Clean up session files
-                if (fs.existsSync(sessionDir)) {
-                    fs.rmSync(sessionDir, { recursive: true, force: true });
-                }
                 session.end();
             }
         } else if (connection === 'close') {
