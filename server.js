@@ -1,9 +1,10 @@
 const express = require('express');
-const fs = require('fs');
+const { put, list, del } = require('@vercel/blob');
 const pino = require('pino');
 const NodeCache = require('node-cache');
 const {
     default: makeWASocket,
+    useMultiFileAuthState,
     delay,
     Browsers,
     makeCacheableSignalKeyStore,
@@ -11,7 +12,6 @@ const {
 } = require('baileys');
 const { createClient } = require('@supabase/supabase-js');
 const { Mutex } = require('async-mutex');
-const { put } = require('@vercel/blob');
 const config = require('./config');
 const path = require('path');
 
@@ -26,139 +26,120 @@ const supabase = createClient(config.SUPABASE_URL, config.SUPABASE_KEY);
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-// WhatsApp connection handler with memory-based session
-async function connector(phoneNumber, res) {
-    const sessionId = Date.now().toString(); // Unique ID for the session
-    const virtualFiles = {}; // Stores session files in memory
-
-    // Initialize auth state
-    const authState = {
-        state: {
-            creds: {
-                noiseKey: { private: Buffer.alloc(32), public: Buffer.alloc(32) },
-                signedIdentityKey: { private: Buffer.alloc(32), public: Buffer.alloc(32) },
-                signedPreKey: { keyPair: { private: Buffer.alloc(32), public: Buffer.alloc(32) } },
-                registrationId: 0,
-                advSecretKey: Buffer.alloc(32).toString('base64'),
-                processedHistoryMessages: [],
-                nextPreKeyId: 1,
-                firstUnuploadedPreKeyId: 1,
-                serverHasPreKeys: false,
-                account: {
-                    details: '',
-                    accountSignatureKey: Buffer.alloc(32).toString('base64'),
-                    deviceSignature: Buffer.alloc(32).toString('base64'),
-                    platform: 'baileys'
-                }
-            },
-            keys: {}
-        },
-        saveCreds: () => {
-            virtualFiles['creds.json'] = JSON.stringify(authState.state.creds);
-        },
-        saveKeys: () => {
-            for (const [id, key] of Object.entries(authState.state.keys)) {
-                virtualFiles[`${id}.json`] = JSON.stringify(key);
-            }
-        }
-    };
-
+// Function to upload session files to Vercel Blob
+async function uploadSessionToBlob(sessionFiles) {
     try {
-        session = makeWASocket({
-            auth: {
-                creds: authState.state.creds,
-                keys: makeCacheableSignalKeyStore(authState.state.keys, pino({ level: 'fatal' }).child({ level: 'fatal' }))
+        const sessionId = Date.now().toString(); // Unique ID for the session
+        const uploadedFiles = [];
+        
+        // Upload each file to Vercel Blob
+        for (const [fileName, fileContent] of Object.entries(sessionFiles)) {
+            const { url } = await put(`${sessionId}/${fileName}`, fileContent, {
+                access: 'public',
+                addRandomSuffix: false
+            });
+            uploadedFiles.push(url);
+        }
+        
+        return { sessionId, urls: uploadedFiles };
+    } catch (error) {
+        console.error('Vercel Blob upload error:', error);
+        throw error;
+    }
+}
+
+// WhatsApp connection handler
+async function connector(phoneNumber, res) {
+    // Use in-memory storage for session files instead of temp directory
+    const sessionFiles = {};
+    
+    const { state, saveCreds } = await useMultiFileAuthState(
+        './temp_session', // This path is virtual when using in-memory
+        {
+            // Custom read/write functions to avoid filesystem
+            readFile: async (filePath) => {
+                const fileName = path.basename(filePath);
+                return sessionFiles[fileName] || null;
             },
-            logger: pino({ level: 'fatal' }).child({ level: 'fatal' }),
-            browser: Browsers.macOS("Safari"),
-            markOnlineOnConnect: true,
-            msgRetryCounterCache,
-            printQRInTerminal: true,
-            getMessage: async () => ({}),
-            version: [2, 2413, 1]
-        });
-
-        session.ev.on('creds.update', authState.saveCreds);
-
-        if (!session.authState.creds.registered) {
-            await delay(1500);
-            const cleanNumber = phoneNumber.replace(/[^0-9]/g, '');
-            const code = await session.requestPairingCode(cleanNumber);
-            
-            if (!res.headersSent) {
-                res.json({ 
-                    success: true,
-                    code: code?.match(/.{1,4}/g)?.join('-'),
-                    message: 'Use this code to pair your device'
-                });
+            writeFile: async (filePath, data) => {
+                const fileName = path.basename(filePath);
+                sessionFiles[fileName] = data;
+            },
+            removeFile: async (filePath) => {
+                const fileName = path.basename(filePath);
+                delete sessionFiles[fileName];
             }
         }
+    );
 
-        session.ev.on('connection.update', async (update) => {
-            const { connection, lastDisconnect } = update;
-            
-            if (connection === 'open') {
-                console.log('WhatsApp connected successfully');
-                await delay(5000);
-                
-                try {
-                    // Save all keys before uploading
-                    authState.saveKeys();
-                    authState.saveCreds();
-                    
-                    // Upload all virtual files
-                    for (const [fileName, fileContent] of Object.entries(virtualFiles)) {
-                        // Upload to Vercel Blob
-                        await put(`${sessionId}/${fileName}`, fileContent, {
-                            access: 'public',
-                            addRandomSuffix: false
-                        });
-                        
-                        // Upload to Supabase
-                        const { error } = await supabase.storage
-                            .from('sessions')
-                            .upload(`${sessionId}/${fileName}`, fileContent);
-                        
-                        if (error) throw error;
-                    }
+    session = makeWASocket({
+        auth: {
+            creds: state.creds,
+            keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' }).child({ level: 'fatal' }))
+        },
+        logger: pino({ level: 'fatal' }).child({ level: 'fatal' }),
+        browser: Browsers.macOS("Safari"),
+        markOnlineOnConnect: true,
+        msgRetryCounterCache
+    });
 
-                    const fullSessionId = config.PREFIX + sessionId;
-                    await session.sendMessage(session.user.id, { 
-                        text: `*Session ID*\n\n${fullSessionId}\n\n${config.MESSAGE}`
-                    });
-                    
-                    if (config.IMAGE) {
-                        await session.sendMessage(session.user.id, { 
-                            image: { url: config.IMAGE },
-                            caption: `Session ID: ${fullSessionId}`
-                        });
-                    }
-                } catch (error) {
-                    console.error('Session handling error:', error);
-                } finally {
-                    // Clear memory
-                    if (session) session.end();
-                }
-            } else if (connection === 'close') {
-                const reason = lastDisconnect?.error?.output?.statusCode;
-                handleDisconnect(reason);
-            }
-        });
-    } catch (error) {
-        console.error('Connection error:', error);
+    if (!session.authState.creds.registered) {
+        await delay(1500);
+        const cleanNumber = phoneNumber.replace(/[^0-9]/g, '');
+        const code = await session.requestPairingCode(cleanNumber);
+        
         if (!res.headersSent) {
-            res.status(500).json({ 
-                success: false,
-                error: 'Failed to initialize WhatsApp connection'
+            res.json({ 
+                success: true,
+                code: code?.match(/.{1,4}/g)?.join('-'),
+                message: 'Use this code to pair your device'
             });
         }
-        if (session) session.end();
     }
+
+    session.ev.on('creds.update', saveCreds);
+
+    session.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect } = update;
+        
+        if (connection === 'open') {
+            console.log('WhatsApp connected successfully');
+            await delay(5000);
+            
+            try {
+                // Upload session to Vercel Blob
+                const { sessionId, urls } = await uploadSessionToBlob(sessionFiles);
+                const fullSessionId = config.PREFIX + sessionId;
+                
+                // Send confirmation with session ID
+                await session.sendMessage(session.user.id, { 
+                    text: `*Session ID*\n\n${fullSessionId}\n\n${config.MESSAGE}`
+                });
+                
+                if (config.IMAGE) {
+                    await session.sendMessage(session.user.id, { 
+                        image: { url: config.IMAGE },
+                        caption: 'Your session has been created successfully!'
+                    });
+                }
+            } catch (error) {
+                console.error('Session handling error:', error);
+            } finally {
+                // Clean up session files from memory
+                Object.keys(sessionFiles).forEach(key => delete sessionFiles[key]);
+                session.end();
+            }
+        } else if (connection === 'close') {
+            const reason = lastDisconnect?.error?.output?.statusCode;
+            handleDisconnect(reason);
+        }
+    });
 }
 
 function handleDisconnect(reason) {
     if ([DisconnectReason.connectionLost, DisconnectReason.connectionClosed, DisconnectReason.restartRequired].includes(reason)) {
         console.log('Connection lost, attempting to reconnect...');
+        connector();
     } else {
         console.log(`Disconnected! Reason: ${reason}`);
         if (session) session.end();
@@ -180,12 +161,10 @@ app.get('/pair', async (req, res) => {
         await connector(phoneNumber, res);
     } catch (error) {
         console.error('Pairing error:', error);
-        if (!res.headersSent) {
-            res.status(500).json({ 
-                success: false,
-                error: 'Failed to generate pairing code'
-            });
-        }
+        res.status(500).json({ 
+            success: false,
+            error: 'Failed to generate pairing code'
+        });
     } finally {
         release();
     }
