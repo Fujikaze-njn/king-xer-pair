@@ -95,31 +95,42 @@ async function uploadSessionToSupabase(sessionId) {
 }
 
 // WhatsApp connection handler
+// WhatsApp connection handler
 async function connector(phoneNumber, res) {
     // Create a virtual session storage using MongoDB
     const virtualSessionDir = {
-        readFile: async (file) => {
-            const sessionData = await Session.findOne({ sessionId: file });
+        readFile: async (filePath) => {
+            // Extract the session ID from the path (last part before .json if present)
+            const sessionId = filePath.split('/').pop().replace('.json', '');
+            const sessionData = await Session.findOne({ sessionId });
             return sessionData ? Buffer.from(JSON.stringify(sessionData.data)) : null;
         },
-        writeFile: async (file, data) => {
+        writeFile: async (filePath, data) => {
+            // Extract the session ID from the path
+            const sessionId = filePath.split('/').pop().replace('.json', '');
             await Session.findOneAndUpdate(
-                { sessionId: file },
+                { sessionId },
                 { data: JSON.parse(data.toString()) },
                 { upsert: true, new: true }
             );
         },
-        removeFile: async (file) => {
-            await Session.deleteOne({ sessionId: file });
+        removeFile: async (filePath) => {
+            const sessionId = filePath.split('/').pop().replace('.json', '');
+            await Session.deleteOne({ sessionId });
         },
-        readDir: async () => {
+        readDir: async (dirPath) => {
+            // For Baileys, we need to return the file names it expects
             const sessions = await Session.find({}, 'sessionId');
-            return sessions.map(s => s.sessionId);
+            return sessions.map(s => `${s.sessionId}.json`);
+        },
+        // Add this to ensure directory structure exists
+        ensureDir: async (dirPath) => {
+            // No-op for MongoDB implementation
+            return true;
         }
     };
 
     const { state, saveCreds } = await useMultiFileAuthState(virtualSessionDir);
-
     session = makeWASocket({
         auth: {
             creds: state.creds,
