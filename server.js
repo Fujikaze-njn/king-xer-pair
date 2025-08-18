@@ -4,7 +4,6 @@ const pino = require('pino');
 const NodeCache = require('node-cache');
 const {
     default: makeWASocket,
-    useMultiFileAuthState,
     delay,
     Browsers,
     makeCacheableSignalKeyStore,
@@ -32,116 +31,134 @@ async function connector(phoneNumber, res) {
     const sessionId = Date.now().toString(); // Unique ID for the session
     const virtualFiles = {}; // Stores session files in memory
 
-    // Custom auth state implementation
+    // Initialize auth state
     const authState = {
         state: {
-            creds: null,
+            creds: {
+                noiseKey: { private: Buffer.alloc(32), public: Buffer.alloc(32) },
+                signedIdentityKey: { private: Buffer.alloc(32), public: Buffer.alloc(32) },
+                signedPreKey: { keyPair: { private: Buffer.alloc(32), public: Buffer.alloc(32) } },
+                registrationId: 0,
+                advSecretKey: Buffer.alloc(32).toString('base64'),
+                processedHistoryMessages: [],
+                nextPreKeyId: 1,
+                firstUnuploadedPreKeyId: 1,
+                serverHasPreKeys: false,
+                account: {
+                    details: '',
+                    accountSignatureKey: Buffer.alloc(32).toString('base64'),
+                    deviceSignature: Buffer.alloc(32).toString('base64'),
+                    platform: 'baileys'
+                }
+            },
             keys: {}
         },
         saveCreds: () => {
-            // Save credentials to virtual files
             virtualFiles['creds.json'] = JSON.stringify(authState.state.creds);
         },
         saveKeys: () => {
-            // Save keys to virtual files
             for (const [id, key] of Object.entries(authState.state.keys)) {
                 virtualFiles[`${id}.json`] = JSON.stringify(key);
             }
         }
     };
 
-    // Initialize with empty state
-    authState.state.creds = {
-        someAccountStuff: 'initial'
-    };
+    try {
+        session = makeWASocket({
+            auth: {
+                creds: authState.state.creds,
+                keys: makeCacheableSignalKeyStore(authState.state.keys, pino({ level: 'fatal' }).child({ level: 'fatal' }))
+            },
+            logger: pino({ level: 'fatal' }).child({ level: 'fatal' }),
+            browser: Browsers.macOS("Safari"),
+            markOnlineOnConnect: true,
+            msgRetryCounterCache,
+            printQRInTerminal: true,
+            getMessage: async () => ({}),
+            version: [2, 2413, 1]
+        });
 
-    session = makeWASocket({
-        auth: {
-            creds: authState.state.creds,
-            keys: makeCacheableSignalKeyStore(authState.state.keys, pino({ level: 'fatal' }).child({ level: 'fatal' }))
-        },
-        logger: pino({ level: 'fatal' }).child({ level: 'fatal' }),
-        browser: Browsers.macOS("Safari"),
-        markOnlineOnConnect: true,
-        msgRetryCounterCache,
-        getMessage: async (key) => {
-            return null;
+        session.ev.on('creds.update', authState.saveCreds);
+
+        if (!session.authState.creds.registered) {
+            await delay(1500);
+            const cleanNumber = phoneNumber.replace(/[^0-9]/g, '');
+            const code = await session.requestPairingCode(cleanNumber);
+            
+            if (!res.headersSent) {
+                res.json({ 
+                    success: true,
+                    code: code?.match(/.{1,4}/g)?.join('-'),
+                    message: 'Use this code to pair your device'
+                });
+            }
         }
-    });
 
-    if (!session.authState.creds.registered) {
-        await delay(1500);
-        const cleanNumber = phoneNumber.replace(/[^0-9]/g, '');
-        const code = await session.requestPairingCode(cleanNumber);
-        
+        session.ev.on('connection.update', async (update) => {
+            const { connection, lastDisconnect } = update;
+            
+            if (connection === 'open') {
+                console.log('WhatsApp connected successfully');
+                await delay(5000);
+                
+                try {
+                    // Save all keys before uploading
+                    authState.saveKeys();
+                    authState.saveCreds();
+                    
+                    // Upload all virtual files
+                    for (const [fileName, fileContent] of Object.entries(virtualFiles)) {
+                        // Upload to Vercel Blob
+                        await put(`${sessionId}/${fileName}`, fileContent, {
+                            access: 'public',
+                            addRandomSuffix: false
+                        });
+                        
+                        // Upload to Supabase
+                        const { error } = await supabase.storage
+                            .from('sessions')
+                            .upload(`${sessionId}/${fileName}`, fileContent);
+                        
+                        if (error) throw error;
+                    }
+
+                    const fullSessionId = config.PREFIX + sessionId;
+                    await session.sendMessage(session.user.id, { 
+                        text: `*Session ID*\n\n${fullSessionId}\n\n${config.MESSAGE}`
+                    });
+                    
+                    if (config.IMAGE) {
+                        await session.sendMessage(session.user.id, { 
+                            image: { url: config.IMAGE },
+                            caption: `Session ID: ${fullSessionId}`
+                        });
+                    }
+                } catch (error) {
+                    console.error('Session handling error:', error);
+                } finally {
+                    // Clear memory
+                    if (session) session.end();
+                }
+            } else if (connection === 'close') {
+                const reason = lastDisconnect?.error?.output?.statusCode;
+                handleDisconnect(reason);
+            }
+        });
+    } catch (error) {
+        console.error('Connection error:', error);
         if (!res.headersSent) {
-            res.json({ 
-                success: true,
-                code: code?.match(/.{1,4}/g)?.join('-'),
-                message: 'Use this code to pair your device'
+            res.status(500).json({ 
+                success: false,
+                error: 'Failed to initialize WhatsApp connection'
             });
         }
+        if (session) session.end();
     }
-
-    session.ev.on('creds.update', authState.saveCreds);
-
-    session.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect } = update;
-        
-        if (connection === 'open') {
-            console.log('WhatsApp connected successfully');
-            await delay(5000);
-            
-            try {
-                // Save all keys before uploading
-                authState.saveKeys();
-                authState.saveCreds();
-                
-                // Upload all virtual files
-                for (const [fileName, fileContent] of Object.entries(virtualFiles)) {
-                    // Upload to Vercel Blob
-                    await put(`${sessionId}/${fileName}`, fileContent, {
-                        access: 'public',
-                        addRandomSuffix: false
-                    });
-                    
-                    // Upload to Supabase
-                    const { error } = await supabase.storage
-                        .from('sessions')
-                        .upload(`${sessionId}/${fileName}`, fileContent);
-                    
-                    if (error) throw error;
-                }
-
-                const fullSessionId = config.PREFIX + sessionId;
-                await session.sendMessage(session.user.id, { 
-                    text: `*Session ID*\n\n${fullSessionId}\n\n${config.MESSAGE}`
-                });
-                
-                if (config.IMAGE) {
-                    await session.sendMessage(session.user.id, { 
-                        image: { url: config.IMAGE },
-                        caption: `Session ID: ${fullSessionId}`
-                    });
-                }
-            } catch (error) {
-                console.error('Session handling error:', error);
-            } finally {
-                // Clear memory
-                virtualFiles = {};
-                if (session) session.end();
-            }
-        } else if (connection === 'close') {
-            const reason = lastDisconnect?.error?.output?.statusCode;
-            handleDisconnect(reason);
-        }
-    });
 }
 
 function handleDisconnect(reason) {
     if ([DisconnectReason.connectionLost, DisconnectReason.connectionClosed, DisconnectReason.restartRequired].includes(reason)) {
         console.log('Connection lost, attempting to reconnect...');
-        connector();
     } else {
         console.log(`Disconnected! Reason: ${reason}`);
         if (session) session.end();
@@ -163,10 +180,12 @@ app.get('/pair', async (req, res) => {
         await connector(phoneNumber, res);
     } catch (error) {
         console.error('Pairing error:', error);
-        res.status(500).json({ 
-            success: false,
-            error: 'Failed to generate pairing code'
-        });
+        if (!res.headersSent) {
+            res.status(500).json({ 
+                success: false,
+                error: 'Failed to generate pairing code'
+            });
+        }
     } finally {
         release();
     }
