@@ -4,7 +4,7 @@ const pino = require('pino');
 const NodeCache = require('node-cache');
 const {
     default: makeWASocket,
-    useSingleFileAuthState,
+    useMultiFileAuthState,
     delay,
     Browsers,
     makeCacheableSignalKeyStore,
@@ -26,22 +26,81 @@ const supabase = createClient(config.SUPABASE_URL, config.SUPABASE_KEY);
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-// WhatsApp connection handler
-async function connector(phoneNumber, res) {
-    const { state, saveCreds } = await useSingleFileAuthState({
-        save: async (data) => {
-            const sessionData = Buffer.from(JSON.stringify(data));
-            const sessionId = Date.now().toString();
-            const fileName = `${sessionId}/creds.json`;
+// Function to upload session folder to Supabase
+async function uploadSession(sessionDir) {
+    try {
+        const files = fs.readdirSync(sessionDir);
+        const sessionId = Date.now().toString(); // Unique ID for the session
+        
+        // Upload each file in the session directory
+        for (const file of files) {
+            const filePath = path.join(sessionDir, file);
+            const fileContent = fs.readFileSync(filePath);
             
             const { error } = await supabase.storage
                 .from('sessions')
-                .upload(fileName, sessionData);
+                .upload(`${sessionId}/${file}`, fileContent);
+            
+            if (error) throw error;
+        }
+        
+        return sessionId;
+    } catch (error) {
+        console.error('Supabase upload error:', error);
+        throw error;
+    }
+}
+
+// Supabase-based auth state handler
+async function useSupabaseAuthState(sessionId) {
+    const credsFile = `${sessionId}/creds.json`;
+    
+    const loadCreds = async () => {
+        try {
+            const { data, error } = await supabase.storage
+                .from('sessions')
+                .download(credsFile);
                 
             if (error) throw error;
-        },
-        load: async () => ({}),
-    });
+            return JSON.parse(await data.text());
+        } catch (e) {
+            return {};
+        }
+    };
+    
+    const saveCreds = async (creds) => {
+        const sessionData = Buffer.from(JSON.stringify(creds));
+        const { error } = await supabase.storage
+            .from('sessions')
+            .upload(credsFile, sessionData, {
+                upsert: true
+            });
+            
+        if (error) throw error;
+    };
+    
+    const state = {
+        creds: await loadCreds(),
+        keys: {}, // You'll need to handle keys similarly
+    };
+    
+    return { state, saveCreds };
+}
+
+// WhatsApp connection handler
+async function connector(phoneNumber, res, useSupabase = false, sessionId = null) {
+    let state, saveCreds;
+    const sessionDir = './temp_session';
+    
+    if (useSupabase && sessionId) {
+        ({ state, saveCreds } = await useSupabaseAuthState(sessionId));
+    } else {
+        // Use local file system for new sessions
+        if (!fs.existsSync(sessionDir)) {
+            fs.mkdirSync(sessionDir);
+        }
+        ({ state, saveCreds } = await useMultiFileAuthState(sessionDir));
+    }
 
     session = makeWASocket({
         auth: {
@@ -54,7 +113,7 @@ async function connector(phoneNumber, res) {
         msgRetryCounterCache
     });
 
-    if (!session.authState.creds.registered) {
+    if (!session.authState.creds.registered && !useSupabase) {
         await delay(1500);
         const cleanNumber = phoneNumber.replace(/[^0-9]/g, '');
         const code = await session.requestPairingCode(cleanNumber);
@@ -75,28 +134,34 @@ async function connector(phoneNumber, res) {
         
         if (connection === 'open') {
             console.log('WhatsApp connected successfully');
-            await delay(5000);
             
-            try {
-                // Get the session ID from the latest creds
-                const sessionId = Object.keys(state.creds)[0] || Date.now().toString();
-                const fullSessionId = config.PREFIX + sessionId;
+            if (!useSupabase) {
+                await delay(5000);
                 
-                // Send confirmation with session ID
-                await session.sendMessage(session.user.id, { 
-                    text: `*Session ID*\n\n${fullSessionId}\n\n${config.MESSAGE}`
-                });
-                
-                if (config.IMAGE) {
+                try {
+                    // Upload session to Supabase only for new sessions
+                    const newSessionId = await uploadSession(sessionDir);
+                    const fullSessionId = config.PREFIX + newSessionId;
+                    
+                    // Send confirmation with session ID
                     await session.sendMessage(session.user.id, { 
-                        image: { url: config.IMAGE },
-                        caption: 'Your session has been created successfully!'
+                        text: `*Session ID*\n\n${fullSessionId}\n\n${config.MESSAGE}`
                     });
+                    
+                    if (config.IMAGE) {
+                        await session.sendMessage(session.user.id, { 
+                            image: { url: config.IMAGE },
+                            caption: 'Your session has been created successfully!'
+                        });
+                    }
+                } catch (error) {
+                    console.error('Session handling error:', error);
+                } finally {
+                    // Clean up session files
+                    if (fs.existsSync(sessionDir)) {
+                        fs.rmSync(sessionDir, { recursive: true, force: true });
+                    }
                 }
-            } catch (error) {
-                console.error('Session handling error:', error);
-            } finally {
-                session.end();
             }
         } else if (connection === 'close') {
             const reason = lastDisconnect?.error?.output?.statusCode;
@@ -133,6 +198,34 @@ app.get('/pair', async (req, res) => {
         res.status(500).json({ 
             success: false,
             error: 'Failed to generate pairing code'
+        });
+    } finally {
+        release();
+    }
+});
+
+// Restore session endpoint
+app.get('/restore', async (req, res) => {
+    const sessionId = req.query.sessionId;
+    if (!sessionId) {
+        return res.status(400).json({ 
+            success: false,
+            error: 'Session ID is required'
+        });
+    }
+  
+    const release = await mutex.acquire();
+    try {
+        await connector(null, res, true, sessionId);
+        res.json({ 
+            success: true,
+            message: 'Session restoration initiated'
+        });
+    } catch (error) {
+        console.error('Restoration error:', error);
+        res.status(500).json({ 
+            success: false,
+            error: 'Failed to restore session'
         });
     } finally {
         release();
