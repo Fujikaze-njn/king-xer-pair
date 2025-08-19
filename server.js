@@ -1,5 +1,5 @@
 const express = require('express');
-const mongoose = require('mongoose');
+const fs = require('fs');
 const pino = require('pino');
 const NodeCache = require('node-cache');
 const {
@@ -8,7 +8,8 @@ const {
     delay,
     Browsers,
     makeCacheableSignalKeyStore,
-    DisconnectReason
+    DisconnectReason,
+    fetchLatestBaileysVersion
 } = require('baileys');
 const { createClient } = require('@supabase/supabase-js');
 const { Mutex } = require('async-mutex');
@@ -16,7 +17,7 @@ const config = require('./config');
 const path = require('path');
 
 const app = express();
-const port = config.PORT || 3000;
+const port = config.PORT || 7860;
 const msgRetryCounterCache = new NodeCache();
 const mutex = new Mutex();
 let session;
@@ -24,68 +25,25 @@ let session;
 // Initialize Supabase client
 const supabase = createClient(config.SUPABASE_URL, config.SUPABASE_KEY);
 
-// Define Mongoose Session Schema
-const sessionSchema = new mongoose.Schema({
-    sessionId: { type: String, required: true, unique: true },
-    data: { type: Object, required: true },
-    createdAt: { type: Date, default: Date.now }
-});
-
-// Create Session model
-const Session = mongoose.model('Session', sessionSchema);
-
-// Connect to MongoDB with Mongoose
-async function connectToMongo() {
-    try {
-        const mongoUri = 'mongodb+srv://Alya:Alya2006@alya.wnpwwot.mongodb.net/whatsapp_sessions?retryWrites=true&w=majority&appName=Alya';
-        
-        await mongoose.connect(mongoUri);
-        
-        console.log('Connected to MongoDB with Mongoose');
-    } catch (error) {
-        console.error('MongoDB connection error:', error);
-        process.exit(1);
-    }
-}
-connectToMongo();
-
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Function to save session to MongoDB
-async function saveSessionToMongo(sessionData) {
+// Function to upload session folder to Supabase
+async function uploadSession(sessionDir) {
     try {
-        const sessionId = Date.now().toString();
-        const newSession = new Session({
-            sessionId,
-            data: sessionData
-        });
+        const files = fs.readdirSync(sessionDir);
+        const sessionId = Date.now().toString(); // Unique ID for the session
         
-        await newSession.save();
-        return sessionId;
-    } catch (error) {
-        console.error('MongoDB save error:', error);
-        throw error;
-    }
-}
-
-// Function to upload session to Supabase from MongoDB
-async function uploadSessionToSupabase(sessionId) {
-    try {
-        const sessionData = await Session.findOne({ sessionId });
-        
-        if (!sessionData) {
-            throw new Error('Session not found in MongoDB');
+        // Upload each file in the session directory
+        for (const file of files) {
+            const filePath = path.join(sessionDir, file);
+            const fileContent = fs.readFileSync(filePath);
+            
+            const { error } = await supabase.storage
+                .from('sessions')
+                .upload(`${sessionId}/${file}`, fileContent);
+            
+            if (error) throw error;
         }
-        
-        // Convert session data to a buffer (simulating file content)
-        const fileContent = Buffer.from(JSON.stringify(sessionData.data));
-        const fileName = `${sessionId}.json`;
-        
-        const { error } = await supabase.storage
-            .from('sessions')
-            .upload(fileName, fileContent);
-        
-        if (error) throw error;
         
         return sessionId;
     } catch (error) {
@@ -95,114 +53,104 @@ async function uploadSessionToSupabase(sessionId) {
 }
 
 // WhatsApp connection handler
-// WhatsApp connection handler
 async function connector(phoneNumber, res) {
-    // Create a virtual session storage using MongoDB
-    const virtualSessionDir = {
-        readFile: async (filePath) => {
-            // Extract the session ID from the path (last part before .json if present)
-            const sessionId = filePath.split('/').pop().replace('.json', '');
-            const sessionData = await Session.findOne({ sessionId });
-            return sessionData ? Buffer.from(JSON.stringify(sessionData.data)) : null;
-        },
-        writeFile: async (filePath, data) => {
-            // Extract the session ID from the path
-            const sessionId = filePath.split('/').pop().replace('.json', '');
-            await Session.findOneAndUpdate(
-                { sessionId },
-                { data: JSON.parse(data.toString()) },
-                { upsert: true, new: true }
-            );
-        },
-        removeFile: async (filePath) => {
-            const sessionId = filePath.split('/').pop().replace('.json', '');
-            await Session.deleteOne({ sessionId });
-        },
-        readDir: async (dirPath) => {
-            // For Baileys, we need to return the file names it expects
-            const sessions = await Session.find({}, 'sessionId');
-            return sessions.map(s => `${s.sessionId}.json`);
-        },
-        // Add this to ensure directory structure exists
-        ensureDir: async (dirPath) => {
-            // No-op for MongoDB implementation
-            return true;
+    const sessionDir = './temp_session';
+    
+    try {
+        if (!fs.existsSync(sessionDir)) {
+            fs.mkdirSync(sessionDir);
         }
-    };
-
-    const { state, saveCreds } = await useMultiFileAuthState(virtualSessionDir);
-    session = makeWASocket({
-        auth: {
-            creds: state.creds,
-            keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' }).child({ level: 'fatal' }))
-        },
-        logger: pino({ level: 'fatal' }).child({ level: 'fatal' }),
-        browser: Browsers.macOS("Safari"),
-        markOnlineOnConnect: true,
-        msgRetryCounterCache
-    });
-
-    if (!session.authState.creds.registered) {
-        await delay(1500);
-        const cleanNumber = phoneNumber.replace(/[^0-9]/g, '');
-        const code = await session.requestPairingCode(cleanNumber);
         
-        if (!res.headersSent) {
-            res.json({ 
-                success: true,
-                code: code?.match(/.{1,4}/g)?.join('-'),
-                message: 'Use this code to pair your device'
-            });
-        }
-    }
+        const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+        const { version } = await fetchLatestBaileysVersion();
 
-    session.ev.on('creds.update', saveCreds);
+        session = makeWASocket({
+            auth: {
+                creds: state.creds,
+                keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' }).child({ level: 'fatal' }))
+            },
+            logger: pino({ level: 'fatal' }).child({ level: 'fatal' }),
+            browser: Browsers.macOS("Safari"),
+            version,
+            markOnlineOnConnect: true,
+            msgRetryCounterCache
+        });
 
-    session.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect } = update;
-        
-        if (connection === 'open') {
-            console.log('WhatsApp connected successfully');
-            await delay(5000);
-            
+        session.ev.on('creds.update', saveCreds);
+
+        if (!session.authState.creds.registered) {
+            await delay(1500);
+            const cleanNumber = phoneNumber.replace(/[^0-9]/g, '');
             try {
-                // Save session to MongoDB
-                const sessionId = await saveSessionToMongo(state);
-                
-                // Upload to Supabase
-                const fullSessionId = config.PREFIX + sessionId;
-                await uploadSessionToSupabase(sessionId);
-                
-                // Send confirmation with session ID
-                await session.sendMessage(session.user.id, { 
-                    text: `*Session ID*\n\n${fullSessionId}\n\n${config.MESSAGE}`
-                });
-                
-                if (config.IMAGE) {
-                    await session.sendMessage(session.user.id, { 
-                        image: { url: config.IMAGE },
-                        caption: 'Your session has been created successfully!'
-                    });
+                const code = await session.requestPairingCode(cleanNumber);
+                if (!res.headersSent) {
+                    res.send({ code: code?.match(/.{1,4}/g)?.join('-') });
                 }
             } catch (error) {
-                console.error('Session handling error:', error);
-            } finally {
-                session.end();
+                console.error('Pairing code request error:', error);
+                if (!res.headersSent) {
+                    res.status(500).json({ 
+                        success: false,
+                        error: 'Failed to generate pairing code'
+                    });
+                }
+                return;
             }
-        } else if (connection === 'close') {
-            const reason = lastDisconnect?.error?.output?.statusCode;
-            handleDisconnect(reason);
         }
-    });
-}
 
-function handleDisconnect(reason) {
-    if ([DisconnectReason.connectionLost, DisconnectReason.connectionClosed, DisconnectReason.restartRequired].includes(reason)) {
-        console.log('Connection lost, attempting to reconnect...');
-        connector();
-    } else {
-        console.log(`Disconnected! Reason: ${reason}`);
-        if (session) session.end();
+        session.ev.on('connection.update', async (update) => {
+            const { connection, lastDisconnect } = update;
+            if (connection === 'open') {
+                console.log('Connected successfully');
+                await delay(5000);
+                
+                try {
+                    // Upload all session files
+                    const sessionId = await uploadSession(sessionDir);
+                    const sID = config.PREFIX + sessionId;
+                    
+                    // Send the image with session ID directly
+                    await session.sendMessage(session.user.id, { 
+                        image: { url: `${config.IMAGE}` }, 
+                        caption: `*Session ID*\n\n${sID}\n\nDo not share this with anyone!` 
+                    });
+                
+                } catch (error) {
+                    console.error('Error:', error);
+                } finally {
+                    if (fs.existsSync(sessionDir)) {
+                        fs.rmSync(sessionDir, { recursive: true, force: true });
+                    }
+                }
+            } else if (connection === 'close') {
+                const reason = lastDisconnect?.error?.output?.statusCode;
+                if (reason === DisconnectReason.loggedOut) {
+                    console.log('Logged out, please restart the server');
+                    if (session) {
+                        session.end();
+                    }
+                    if (fs.existsSync(sessionDir)) {
+                        fs.rmSync(sessionDir, { recursive: true, force: true });
+                    }
+                } else {
+                    console.log('Connection lost, reconnecting...');
+                    setTimeout(() => connector(phoneNumber, res), 5000);
+                }
+            }
+        });
+    } catch (error) {
+        console.error('Connector error:', error);
+        if (!res.headersSent) {
+            res.status(500).json({ 
+                success: false,
+                error: 'Connection failed',
+                details: error.message
+            });
+        }
+        // Clean up session directory on error
+        if (fs.existsSync(sessionDir)) {
+            fs.rmSync(sessionDir, { recursive: true, force: true });
+        }
     }
 }
 
@@ -221,10 +169,13 @@ app.get('/pair', async (req, res) => {
         await connector(phoneNumber, res);
     } catch (error) {
         console.error('Pairing error:', error);
-        res.status(500).json({ 
-            success: false,
-            error: 'Failed to generate pairing code'
-        });
+        if (!res.headersSent) {
+            res.status(500).json({ 
+                success: false,
+                error: 'Failed to generate pairing code',
+                details: error.message
+            });
+        }
     } finally {
         release();
     }
@@ -237,10 +188,4 @@ app.get('/', (req, res) => {
 
 app.listen(port, () => {
     console.log(`Server running on port ${port}`);
-});
-
-// Close Mongoose connection on process exit
-process.on('SIGINT', async () => {
-    await mongoose.connection.close();
-    process.exit();
 });
