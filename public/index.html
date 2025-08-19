@@ -398,12 +398,13 @@
                 const response = await fetch(`/pair?number=${encodeURIComponent(phoneNumber)}`);
                 const data = await response.json();
                 
-                if (data.success) {
+                if (response.ok && data.code) {
                     pairingCode.textContent = data.code;
                     result.style.display = 'block';
                     showToast('Pairing code generated successfully!');
                 } else {
-                    showToast(data.error || 'Failed to generate pairing code', true);
+                    const errorMessage = data.error || 'Failed to generate pairing code';
+                    showToast(errorMessage, true);
                 }
             } catch (error) {
                 console.error('Pairing error:', error);
@@ -431,4 +432,4 @@
         }
     </script>
 </body>
-  </html>
+</html>
