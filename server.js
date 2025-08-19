@@ -22,24 +22,20 @@ const msgRetryCounterCache = new NodeCache();
 const mutex = new Mutex();
 let session;
 
-// Initialize Supabase client
 const supabase = createClient(config.SUPABASE_URL, config.SUPABASE_KEY);
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Function to upload session folder to Supabase
 async function uploadSession(sessionDir) {
     try {
         const files = fs.readdirSync(sessionDir);
-        const sessionId = Date.now().toString(); // Unique ID for the session
-        
-        // Upload each file in the session directory
+        const sessionId = Date.now().toString();
         for (const file of files) {
             const filePath = path.join(sessionDir, file);
             const fileContent = fs.readFileSync(filePath);
             
             const { error } = await supabase.storage
-                .from('sessions')
+                .from('session')
                 .upload(`${sessionId}/${file}`, fileContent);
             
             if (error) throw error;
