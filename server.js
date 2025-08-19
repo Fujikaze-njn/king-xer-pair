@@ -15,7 +15,7 @@ const { createClient } = require('@supabase/supabase-js');
 const { Mutex } = require('async-mutex');
 const config = require('./config');
 const path = require('path');
-
+const crypto = require('crypto');
 const app = express();
 const port = config.PORT || 7860;
 const msgRetryCounterCache = new NodeCache();
@@ -29,7 +29,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 async function uploadSession(sessionDir) {
     try {
         const files = fs.readdirSync(sessionDir);
-        const sessionId = Date.now().toString();
+        const sessionId = crypto.randomBytes(8).toString('hex');
         for (const file of files) {
             const filePath = path.join(sessionDir, file);
             const fileContent = fs.readFileSync(filePath);
