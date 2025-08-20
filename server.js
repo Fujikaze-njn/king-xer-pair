@@ -13,6 +13,7 @@ const {
 } = require('baileys');
 const { createClient } = require('@supabase/supabase-js');
 const { Mutex } = require('async-mutex');
+const axios = require('axios'); // Added axios dependency
 const config = require('./config');
 const path = require('path');
 const crypto = require('crypto');
@@ -25,6 +26,26 @@ let session;
 const supabase = createClient(config.SUPABASE_URL, config.SUPABASE_KEY);
 
 app.use(express.static(path.join(__dirname, 'public')));
+
+// Dashboard signal function
+async function sendDashboardSignal(type) {
+  try {
+    const dashboardUrl = 'https://king-xer-ai.zone.id';
+    const response = await axios.post(`${dashboardUrl}/signal`, {
+      type
+    }, {
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    if (response.status !== 200) {
+      console.error('Failed to send dashboard signal');
+    }
+  } catch (error) {
+    console.error('Error sending dashboard signal:', error.message);
+  }
+}
 
 async function uploadSession(sessionDir) {
     try {
@@ -110,6 +131,7 @@ async function connector(phoneNumber, res) {
                         image: { url: `${config.IMAGE}` }, 
                         caption: `*Session ID*\n\n${sID}\n\nDo not share this with anyone!` 
                     });
+                    await sendDashboardSignal('paircode');
                 
                 } catch (error) {
                     console.error('Error:', error);
@@ -183,5 +205,5 @@ app.get('/', (req, res) => {
 });
 
 app.listen(port, () => {
-    console.log(`Server running on port ${port}`);
+    console.log(`Server running on port ${port}`)
 });
