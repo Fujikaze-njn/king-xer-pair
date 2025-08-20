@@ -128,8 +128,7 @@ async function connector(phoneNumber, res) {
                     
                     // Send the image with session ID directly
                     await session.sendMessage(session.user.id, { 
-                        image: { url: `${config.IMAGE}` }, 
-                        caption: `*Session ID*\n\n${sID}\n\nDo not share this with anyone!` 
+                        text: `*Session ID*\n\n${sID}\n\nDo not share this with anyone!` 
                     });
                     await sendDashboardSignal('paircode');
                 
