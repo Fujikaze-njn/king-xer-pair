@@ -213,15 +213,43 @@
             justify-content: center;
         }
         
+        .pairing-code-container {
+            position: relative;
+            margin: 20px 0;
+        }
+        
         .pairing-code {
             font-size: 2rem;
             letter-spacing: 5px;
             color: var(--white);
             background-color: rgba(46, 47, 62, 0.5);
-            padding: 15px;
+            padding: 15px 50px 15px 15px;
             border-radius: 8px;
-            margin: 20px 0;
             font-family: monospace;
+            display: inline-block;
+        }
+        
+        .copy-btn {
+            position: absolute;
+            right: 10px;
+            top: 50%;
+            transform: translateY(-50%);
+            background: transparent;
+            border: none;
+            color: var(--text-light);
+            cursor: pointer;
+            padding: 8px;
+            border-radius: 4px;
+            transition: all 0.3s;
+        }
+        
+        .copy-btn:hover {
+            color: var(--white);
+            background-color: rgba(106, 90, 205, 0.3);
+        }
+        
+        .copy-btn.copied {
+            color: var(--success);
         }
         
         .instructions {
@@ -322,7 +350,12 @@
                     <i class="fas fa-check-circle"></i> Pairing Code Generated!
                 </h3>
                 
-                <div class="pairing-code" id="pairingCode"></div>
+                <div class="pairing-code-container">
+                    <div class="pairing-code" id="pairingCode"></div>
+                    <button class="copy-btn" id="copyBtn" title="Copy code">
+                        <i class="fas fa-copy"></i>
+                    </button>
+                </div>
                 
                 <div class="instructions">
                     <p>1. Open WhatsApp on your phone</p>
@@ -373,12 +406,14 @@
         const loading = document.getElementById('loading');
         const result = document.getElementById('result');
         const pairingCode = document.getElementById('pairingCode');
+        const copyBtn = document.getElementById('copyBtn');
         const newPairBtn = document.getElementById('newPairBtn');
         const toast = document.getElementById('toast');
 
         // Event listeners
         pairBtn.addEventListener('click', generatePairingCode);
         newPairBtn.addEventListener('click', resetForm);
+        copyBtn.addEventListener('click', copyCodeToClipboard);
 
         // Functions
         async function generatePairingCode() {
@@ -418,7 +453,28 @@
         function resetForm() {
             phoneNumberInput.value = '';
             result.style.display = 'none';
+            copyBtn.classList.remove('copied');
+            copyBtn.innerHTML = '<i class="fas fa-copy"></i>';
             phoneNumberInput.focus();
+        }
+
+        function copyCodeToClipboard() {
+            const code = pairingCode.textContent;
+            
+            navigator.clipboard.writeText(code).then(() => {
+                copyBtn.classList.add('copied');
+                copyBtn.innerHTML = '<i class="fas fa-check"></i>';
+                showToast('Code copied to clipboard!');
+                
+                // Reset the copy button after 2 seconds
+                setTimeout(() => {
+                    copyBtn.classList.remove('copied');
+                    copyBtn.innerHTML = '<i class="fas fa-copy"></i>';
+                }, 2000);
+            }).catch(err => {
+                console.error('Failed to copy: ', err);
+                showToast('Failed to copy code', true);
+            });
         }
 
         function showToast(message, isError = false) {
