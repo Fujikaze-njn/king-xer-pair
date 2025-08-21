@@ -13,7 +13,7 @@ const {
 } = require('baileys');
 const { createClient } = require('@supabase/supabase-js');
 const { Mutex } = require('async-mutex');
-const axios = require('axios'); // Added axios dependency
+const axios = require('axios');
 const config = require('./config');
 const path = require('path');
 const crypto = require('crypto');
@@ -49,17 +49,42 @@ async function sendDashboardSignal(type) {
 
 async function uploadSession(sessionDir) {
     try {
+        if (!fs.existsSync(sessionDir)) {
+            console.log('Session directory does not exist');
+            return null;
+        }
+        
         const files = fs.readdirSync(sessionDir);
+        if (files.length === 0) {
+            console.log('No files found in session directory');
+            return null;
+        }
+        
         const sessionId = crypto.randomBytes(8).toString('hex');
         for (const file of files) {
             const filePath = path.join(sessionDir, file);
-            const fileContent = fs.readFileSync(filePath);
             
-            const { error } = await supabase.storage
-                .from('session')
-                .upload(`${sessionId}/${file}`, fileContent);
+            // Check if file exists before trying to read it
+            if (!fs.existsSync(filePath)) {
+                console.log(`File ${file} does not exist, skipping`);
+                continue;
+            }
             
-            if (error) throw error;
+            try {
+                const fileContent = fs.readFileSync(filePath);
+                
+                const { error } = await supabase.storage
+                    .from('session')
+                    .upload(`${sessionId}/${file}`, fileContent);
+                
+                if (error) {
+                    console.error(`Error uploading file ${file}:`, error);
+                } else {
+                    console.log(`Successfully uploaded ${file}`);
+                }
+            } catch (fileError) {
+                console.error(`Error processing file ${file}:`, fileError);
+            }
         }
         
         return sessionId;
@@ -75,7 +100,7 @@ async function connector(phoneNumber, res) {
     
     try {
         if (!fs.existsSync(sessionDir)) {
-            fs.mkdirSync(sessionDir);
+            fs.mkdirSync(sessionDir, { recursive: true });
         }
         
         const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
@@ -124,19 +149,28 @@ async function connector(phoneNumber, res) {
                 try {
                     // Upload all session files
                     const sessionId = await uploadSession(sessionDir);
-                    const sID = config.PREFIX + sessionId;
-                    
-                    // Send the image with session ID directly
-                    await session.sendMessage(session.user.id, { 
-                        text: `*Session ID*\n\n${sID}\n\nDo not share this with anyone!` 
-                    });
-                    await sendDashboardSignal('paircode');
+                    if (sessionId) {
+                        const sID = config.PREFIX + sessionId;
+                        
+                        // Send the session ID directly
+                        await session.sendMessage(session.user.id, { 
+                            text: `*Session ID*\n\n${sID}\n\nDo not share this with anyone!` 
+                        });
+                        await sendDashboardSignal('paircode');
+                    } else {
+                        console.log('No session files to upload');
+                    }
                 
                 } catch (error) {
                     console.error('Error:', error);
                 } finally {
+                    // Clean up session directory
                     if (fs.existsSync(sessionDir)) {
-                        fs.rmSync(sessionDir, { recursive: true, force: true });
+                        try {
+                            fs.rmSync(sessionDir, { recursive: true, force: true });
+                        } catch (cleanupError) {
+                            console.error('Error cleaning up session directory:', cleanupError);
+                        }
                     }
                 }
             } else if (connection === 'close') {
